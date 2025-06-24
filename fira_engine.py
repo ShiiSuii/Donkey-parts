@@ -4,20 +4,20 @@ import apriltag
 from PIL import Image
 import time
 import pyrealsense2 as rs
+from donkeycar.parts.velocity import VelocityUnnormalize
 import os
 
-# Función para chequear si hay un monitor conectado
+# Función para verificar si hay entorno gráfico
 def is_display_available():
     return os.environ.get("DISPLAY") is not None
 
 # Función segura para mostrar imágenes
 def safe_imshow(winname, img):
-    if is_display_available():
-        try:
-            cv2.imshow(winname, img)
-            cv2.waitKey(1)
-        except cv2.error:
-            pass
+    try:
+        cv2.imshow(winname, img)
+        cv2.waitKey(1)
+    except cv2.error:
+        pass
 
 class AprilTagDetector(object):
     def __init__(self, tag_dict, proximity_thresholds):
@@ -39,6 +39,7 @@ class AprilTagDetector(object):
         return False
 
     def draw_bounding_box(self, tag, img_arr):
+        img_arr = np.ascontiguousarray(img_arr)
         for corner in tag.corners:
             cv2.circle(img_arr, tuple(corner.astype(int)), 5, (0, 255, 0), -1)
         cv2.polylines(img_arr, [tag.corners.astype(int)], True, (0, 255, 0), 2)
@@ -54,14 +55,16 @@ class ZebraCrosswalkDetector(object):
             self.last_detection_time = current_time
             gray_img = cv2.cvtColor(img_arr, cv2.COLOR_BGR2GRAY)
             edges = cv2.Canny(gray_img, 175, 225, apertureSize=3)
+            lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 20, minLineLength=21, maxLineGap=5)
             if debug_visuals:
                 safe_imshow('Crosswalk', edges)
-            lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 20, minLineLength=21, maxLineGap=5)
             if lines is not None:
-                return [line for line in lines if abs(line[0][0] - line[0][2]) < 10]
+                vertical_lines = [line for line in lines if abs(line[0][0] - line[0][2]) < 10]
+                return vertical_lines
         return []
 
     def draw_crosswalk_lines(self, lines, img_arr):
+        img_arr = np.ascontiguousarray(img_arr)
         for line in lines:
             for x1, y1, x2, y2 in line:
                 cv2.line(img_arr, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -69,8 +72,8 @@ class ZebraCrosswalkDetector(object):
 class TurnManager(object):
     def __init__(self, turn_duration, initial_wait_time):
         self.turn_duration = turn_duration
-        self.initial_wait_time = initial_wait_time
         self.turn_start_time = 0
+        self.initial_wait_time = initial_wait_time
         self.wait_start_time = 0
 
     def start_turn(self):
@@ -96,8 +99,8 @@ class ProceedManager(object):
         return time.time() - self.proceed_start_time < self.correction_duration
 
     def is_going_straight(self):
-        elapsed = time.time() - self.proceed_start_time
-        return self.correction_duration <= elapsed < (self.correction_duration + self.straight_duration)
+        elapsed_time = time.time() - self.proceed_start_time
+        return self.correction_duration <= elapsed_time < (self.correction_duration + self.straight_duration)
 
 class FIRAEngine(object):
     def __init__(self, tag_dict, proximity_thresholds, apriltag_hz, zebra_hz, top_crop_ratio,
@@ -120,6 +123,13 @@ class FIRAEngine(object):
         self.apriltag_hz = apriltag_hz
         self.top_crop_ratio = top_crop_ratio
         self.speed_scale = speed_scale
+
+        # Speeds in m/s (deseadas)
+        self.turn_target_speed = 0.3
+        self.forward_target_speed = 0.5
+        self.correction_target_speed = 0.4
+
+        self.velocity_map = VelocityUnnormalize(min_speed=0.2, max_speed=1.2)
 
         self.apriltag_detector = AprilTagDetector(tag_dict, proximity_thresholds)
         self.zebra_crosswalk_detector = ZebraCrosswalkDetector(zebra_hz)
@@ -183,6 +193,8 @@ class FIRAEngine(object):
             if self.apriltag_detector.is_tag_close(tag):
                 tag_name = self.apriltag_detector.tag_dict.get(tag.tag_id, 'UNKNOWN')
                 self.detected_apriltag = tag_name
+                if self.debug_visuals:
+                    self.apriltag_detector.draw_bounding_box(tag, img_arr)
                 if self.debug:
                     print(f"Detected tag: {tag.tag_id} - {tag_name}")
                 if tag_name in ['STOP', 'DEAD_END']:
@@ -234,37 +246,45 @@ class FIRAEngine(object):
 
         elif self.state in ['turn_left', 'turn_right']:
             if self.turn_manager.is_waiting():
-                return 0, 1 * self.speed_scale, input_img_arr
+                throttle = self.velocity_map.run(self.turn_target_speed) * self.speed_scale
+                return 0, throttle, input_img_arr
             if self.turn_manager.is_turning():
                 turn_angle = -1 if self.state == 'turn_left' else 1
-                return turn_angle, 1 * self.speed_scale, input_img_arr
+                throttle = self.velocity_map.run(self.turn_target_speed) * self.speed_scale
+                return turn_angle, throttle, input_img_arr
             else:
                 self.state = 'correction_after_turn'
                 self.proceed_manager.start_proceed()
                 return angle, throttle, input_img_arr
 
         elif self.state == 'proceeding':
+            throttle = self.velocity_map.run(self.forward_target_speed) * self.speed_scale
             if self.proceed_manager.is_correcting():
                 correction_angle, show_img = self.detect_lane_and_correction(show_img)
-                return correction_angle, 1 * self.speed_scale, input_img_arr
+                return correction_angle, throttle, input_img_arr
             elif self.proceed_manager.is_going_straight():
-                return 0, 1 * self.speed_scale, input_img_arr
+                return 0, throttle, input_img_arr
             else:
                 self.state = 'idle'
-                return 0, 1 * self.speed_scale, input_img_arr
+                return 0, throttle, input_img_arr
 
         elif self.state == 'correction_after_turn':
+            throttle = self.velocity_map.run(self.correction_target_speed) * self.speed_scale
             if self.proceed_manager.is_correcting():
                 correction_angle, show_img = self.detect_lane_and_correction(show_img)
-                return correction_angle, 1 * self.speed_scale, input_img_arr
+                return correction_angle, throttle, input_img_arr
             else:
                 self.state = 'idle'
-                return 0, 1 * self.speed_scale, input_img_arr
+                return 0, throttle, input_img_arr
 
         elif self.state == 'idle':
             if current_time - self.last_apriltag_detection_time >= 1.0 / self.apriltag_hz:
                 self.last_apriltag_detection_time = current_time
                 angle, throttle, _ = self.detect_apriltags_and_update_state(cropped_rs_img, current_time, throttle, angle)
+
+            # Limitar la velocidad del modelo
+            max_throttle = self.velocity_map.run(0.6) * self.speed_scale
+            throttle = min(throttle, max_throttle)
 
         if self.debug_visuals:
             safe_imshow('Realsense', cropped_rs_img)
